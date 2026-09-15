@@ -8,6 +8,11 @@ plugins {
     id("org.jetbrains.kotlin.jvm")
 }
 
+// Coordinates so a consuming app can depend on "com.ponydirect:ponydirect" and, in a
+// local composite build (includeBuild), Gradle substitutes this project for it.
+group = "com.ponydirect"
+version = "0.1.0"
+
 java {
     sourceCompatibility = JavaVersion.VERSION_17
     targetCompatibility = JavaVersion.VERSION_17

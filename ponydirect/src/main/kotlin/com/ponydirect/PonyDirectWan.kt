@@ -43,6 +43,7 @@ class PonyDirectWan(
         val sessionNonce: ByteArray,
         val chunks: List<ByteArray>,
         var roundsLeft: Int,
+        val onComplete: ((Boolean) -> Unit)?,
     ) {
         val ackedBitmap = ByteArray(PonyDirectArq.bitmapLen(chunks.size))
     }
@@ -322,7 +323,7 @@ class PonyDirectWan(
     /** Queue a payload for reliable delivery over the connected direct path. Returns
      *  false (so the caller uses the relay) if there is no live path or the payload
      *  exceeds the direct-path size cap. */
-    fun sendPayload(payload: ByteArray, peerID: String): Boolean = try {
+    fun sendPayload(payload: ByteArray, peerID: String, onComplete: ((Boolean) -> Unit)? = null): Boolean = try {
         exec.submit(java.util.concurrent.Callable {
             val s = sessions[peerID] ?: return@Callable false
             val remote = s.activeRemote ?: return@Callable false
@@ -331,7 +332,7 @@ class PonyDirectWan(
             val chunks = PonyDirectArq.chunk(payload)
             if (chunks.size > maxChunks) return@Callable false
             val seq = nextMsgSeq++
-            val msg = OutgoingMsg(peerID, s.sessionNonce, chunks, arqRounds)
+            val msg = OutgoingMsg(peerID, s.sessionNonce, chunks, arqRounds, onComplete)
             outgoing[seq] = msg
             sendUnacked(seq, msg, pairKey, remote)
             ensureArqTimer()
@@ -362,9 +363,9 @@ class PonyDirectWan(
             val s = sessions[msg.peerID]
             val remote = s?.activeRemote
             val pairKey = keys.pairKey(msg.peerID)
-            if (s == null || s.state != PathState.CONNECTED || remote == null || pairKey == null) { it.remove(); continue }
+            if (s == null || s.state != PathState.CONNECTED || remote == null || pairKey == null) { it.remove(); msg.onComplete?.invoke(false); continue }
             msg.roundsLeft--
-            if (msg.roundsLeft <= 0) { it.remove(); continue }
+            if (msg.roundsLeft <= 0) { it.remove(); msg.onComplete?.invoke(false); continue }
             sendUnacked(seq, msg, pairKey, remote)
         }
         if (outgoing.isEmpty()) { arqTask?.cancel(false); arqTask = null }
@@ -414,7 +415,7 @@ class PonyDirectWan(
         for (i in 0 until count) if (PonyDirectArq.bitmapGet(ap.bitmap, i)) PonyDirectArq.bitmapSet(msg.ackedBitmap, i)
         var allAcked = true
         for (i in 0 until count) if (!PonyDirectArq.bitmapGet(msg.ackedBitmap, i)) { allAcked = false; break }
-        if (allAcked) outgoing.remove(ap.msgSeq)
+        if (allAcked) { outgoing.remove(ap.msgSeq); msg.onComplete?.invoke(true) }
     }
 
     fun stateOf(peerID: String): PathState = sessions[peerID]?.state ?: PathState.IDLE

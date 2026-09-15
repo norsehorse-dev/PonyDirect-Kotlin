@@ -89,7 +89,14 @@ class PonyDirectWan(
 
     /** Open a path to [peerID]. Initiator mints the session nonce and sends the offer. */
     fun open(peerID: String, role: Role) = exec.execute {
-        if (sessions.containsKey(peerID)) return@execute
+        val existing = sessions[peerID]
+        if (existing != null) {
+            // Already tracking this peer; if it is a not-yet-connected initiator,
+            // make sure it is still offering (recover a stalled session without a
+            // manual re-toggle).
+            if (existing.role == Role.INITIATOR && existing.state != PathState.CONNECTED) ensureOfferTimer()
+            return@execute
+        }
         val nonce = if (role == Role.INITIATOR) PonyDirectWire.randomBytes(16) else ByteArray(0)
         val session = Session(peerID, role, nonce)
         sessions[peerID] = session
@@ -219,7 +226,16 @@ class PonyDirectWan(
             anyPunching = true
             val pairKey = keys.pairKey(session.peerID) ?: continue
             session.probeRounds++
-            if (session.probeRounds > maxProbeRounds) { setState(session, PathState.FAILED); continue }
+            if (session.probeRounds > maxProbeRounds) {
+                // Punch attempt exhausted. Fall back to re-offering (fresh candidates)
+                // rather than a terminal failure, so it keeps trying while WAN is on
+                // and reconnects on its own after a network change, no re-toggle.
+                session.probeRounds = 0
+                session.remoteCandidates = ArrayList()
+                setState(session, PathState.GATHERING)
+                ensureOfferTimer()
+                continue
+            }
             for (cand in session.remoteCandidates) {
                 val hp = splitHostPort(cand) ?: continue
                 val probeNonce = PonyDirectWire.randomBytes(16)

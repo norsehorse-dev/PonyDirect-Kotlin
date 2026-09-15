@@ -35,6 +35,7 @@ class PonyDirectWan(
         var activeRemote: PonyDirectUdpSocket.Source? = null
         var state: PathState = PathState.IDLE
         var probeRounds = 0
+        var offerRounds = 0
     }
 
     private val socket = PonyDirectUdpSocket()
@@ -46,11 +47,14 @@ class PonyDirectWan(
     @Volatile private var reflexive: String? = null
     private var hostCandidates: List<String> = emptyList()
     private var probeTask: ScheduledFuture<*>? = null
+    private var offerTask: ScheduledFuture<*>? = null
     private var keepaliveTask: ScheduledFuture<*>? = null
 
     private val probeIntervalMs = 250L
     private val maxProbeRounds = 40
     private val keepaliveIntervalMs = 15_000L
+    private val offerIntervalMs = 2_000L     // re-send the offer until answered
+    private val maxOfferRounds = 15          // fast-retry burst (~30s), then slow back-off
 
     init {
         socket.onDatagram = { data, source -> exec.execute { handleDatagram(data, source) } }
@@ -65,7 +69,12 @@ class PonyDirectWan(
         sessions[peerID] = session
         setState(session, PathState.GATHERING)
         gatherCandidates()
-        if (role == Role.INITIATOR) sendOffer(session)
+        if (role == Role.INITIATOR) {
+            // Send the offer now, then re-send on a timer until an answer arrives,
+            // so the order the two sides enable WAN does not matter.
+            sendOffer(session)
+            ensureOfferTimer()
+        }
     }
 
     fun close(peerID: String) = exec.execute {
@@ -151,6 +160,25 @@ class PonyDirectWan(
         if (session.state != PathState.GATHERING && session.state != PathState.PUNCHING) return
         if (session.state != PathState.PUNCHING) setState(session, PathState.PUNCHING)
         ensureProbeTimer()
+    }
+
+    private fun ensureOfferTimer() {
+        if (offerTask != null) return
+        offerTask = exec.scheduleAtFixedRate({ offerTick() }, offerIntervalMs, offerIntervalMs, TimeUnit.MILLISECONDS)
+    }
+
+    private fun offerTick() {
+        var anyWaiting = false
+        for (session in sessions.values) {
+            if (session.role != Role.INITIATOR || session.state != PathState.GATHERING) continue
+            anyWaiting = true
+            session.offerRounds++
+            // Fast-retry burst (~30s), then back off to about every 16s and keep
+            // trying while WAN is on and unanswered, so the peer can enable WAN at
+            // any later time and still connect.
+            if (session.offerRounds <= maxOfferRounds || session.offerRounds % 8 == 0) sendOffer(session)
+        }
+        if (!anyWaiting) { offerTask?.cancel(false); offerTask = null }
     }
 
     private fun ensureProbeTimer() {
@@ -240,6 +268,7 @@ class PonyDirectWan(
 
     private fun stopTimers() {
         stopProbeTimer()
+        offerTask?.cancel(false); offerTask = null
         keepaliveTask?.cancel(false); keepaliveTask = null
     }
 

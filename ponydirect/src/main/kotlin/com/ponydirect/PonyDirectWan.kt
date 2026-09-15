@@ -38,6 +38,21 @@ class PonyDirectWan(
         var offerRounds = 0
     }
 
+    private class OutgoingMsg(
+        val peerID: String,
+        val sessionNonce: ByteArray,
+        val chunks: List<ByteArray>,
+        var roundsLeft: Int,
+    ) {
+        val ackedBitmap = ByteArray(PonyDirectArq.bitmapLen(chunks.size))
+    }
+
+    private class Reassembly(val chunkCount: Int) {
+        val chunks = arrayOfNulls<ByteArray>(chunkCount)
+        val bitmap = ByteArray(PonyDirectArq.bitmapLen(chunkCount))
+        var received = 0
+    }
+
     private val socket = PonyDirectUdpSocket()
     private val exec = Executors.newSingleThreadScheduledExecutor { r ->
         Thread(r, "ponydirect-wan").apply { isDaemon = true }
@@ -49,12 +64,22 @@ class PonyDirectWan(
     private var probeTask: ScheduledFuture<*>? = null
     private var offerTask: ScheduledFuture<*>? = null
     private var keepaliveTask: ScheduledFuture<*>? = null
+    private var arqTask: ScheduledFuture<*>? = null
+    private var nextMsgSeq = 1
+    private val outgoing = HashMap<Int, OutgoingMsg>()
+    private val incoming = HashMap<String, Reassembly>()
+    private val completed = ArrayDeque<String>()
+    private val completedKeys = HashSet<String>()
 
     private val probeIntervalMs = 250L
     private val maxProbeRounds = 40
     private val keepaliveIntervalMs = 15_000L
     private val offerIntervalMs = 2_000L     // re-send the offer until answered
     private val maxOfferRounds = 15          // fast-retry burst (~30s), then slow back-off
+    private val arqIntervalMs = 500L         // retransmit unacked chunks this often
+    private val arqRounds = 20               // ~10s to deliver before giving up (relay covers it)
+    private val maxChunks = 256              // 256 KB cap; larger payloads go by relay
+    private val completedCap = 256
 
     init {
         socket.onDatagram = { data, source -> exec.execute { handleDatagram(data, source) } }
@@ -208,6 +233,7 @@ class PonyDirectWan(
     // Datagram intake -------------------------------------------------------
 
     private fun handleDatagram(data: ByteArray, source: PonyDirectUdpSocket.Source) {
+        if (data.isEmpty()) return
         val txn = stunTxn
         if (txn != null) {
             val mapped = PonyDirectStun.parseResponse(data, txn)
@@ -218,6 +244,24 @@ class PonyDirectWan(
                     signaling.sendSignal(PonyDirectSignal(PonyDirectSignal.Kind.ICE, candidate = reflexive), s.peerID)
                 }
                 flushPending()
+                return
+            }
+        }
+        when (data[0]) {
+            PonyDirectArq.DATA -> {
+                val dp = PonyDirectArq.parseData(data) ?: return
+                val session = sessions.values.firstOrNull { PonyDirectWire.constantTimeEquals(it.sessionNonce, dp.sessionNonce) } ?: return
+                val pairKey = keys.pairKey(session.peerID) ?: return
+                if (!PonyDirectArq.verifyData(dp, pairKey)) return
+                handleData(dp, session, pairKey)
+                return
+            }
+            PonyDirectArq.ACK -> {
+                val ap = PonyDirectArq.parseAck(data) ?: return
+                val session = sessions.values.firstOrNull { PonyDirectWire.constantTimeEquals(it.sessionNonce, ap.sessionNonce) } ?: return
+                val pairKey = keys.pairKey(session.peerID) ?: return
+                if (!PonyDirectArq.verifyAck(ap, pairKey)) return
+                handleAck(ap, session)
                 return
             }
         }
@@ -270,17 +314,107 @@ class PonyDirectWan(
         stopProbeTimer()
         offerTask?.cancel(false); offerTask = null
         keepaliveTask?.cancel(false); keepaliveTask = null
+        arqTask?.cancel(false); arqTask = null
     }
 
     // Public helpers --------------------------------------------------------
 
-    /** Send an application payload over an established path (M3 delivery). */
-    fun sendPayload(payload: ByteArray, peerID: String): Boolean {
-        val s = sessions[peerID] ?: return false
-        val r = s.activeRemote ?: return false
-        if (s.state != PathState.CONNECTED) return false
-        socket.send(PonyDirectWire.frame(PonyDirectWire.ENVELOPE, payload), r.host, r.port)
-        return true
+    /** Queue a payload for reliable delivery over the connected direct path. Returns
+     *  false (so the caller uses the relay) if there is no live path or the payload
+     *  exceeds the direct-path size cap. */
+    fun sendPayload(payload: ByteArray, peerID: String): Boolean = try {
+        exec.submit(java.util.concurrent.Callable {
+            val s = sessions[peerID] ?: return@Callable false
+            val remote = s.activeRemote ?: return@Callable false
+            if (s.state != PathState.CONNECTED) return@Callable false
+            val pairKey = keys.pairKey(peerID) ?: return@Callable false
+            val chunks = PonyDirectArq.chunk(payload)
+            if (chunks.size > maxChunks) return@Callable false
+            val seq = nextMsgSeq++
+            val msg = OutgoingMsg(peerID, s.sessionNonce, chunks, arqRounds)
+            outgoing[seq] = msg
+            sendUnacked(seq, msg, pairKey, remote)
+            ensureArqTimer()
+            true
+        }).get()
+    } catch (e: Exception) { false }
+
+    private fun sendUnacked(seq: Int, msg: OutgoingMsg, pairKey: ByteArray, remote: PonyDirectUdpSocket.Source) {
+        val count = msg.chunks.size
+        for (i in 0 until count) {
+            if (PonyDirectArq.bitmapGet(msg.ackedBitmap, i)) continue
+            socket.send(
+                PonyDirectArq.data(pairKey, msg.sessionNonce, seq, i, count, msg.chunks[i]),
+                remote.host, remote.port
+            )
+        }
+    }
+
+    private fun ensureArqTimer() {
+        if (arqTask != null) return
+        arqTask = exec.scheduleAtFixedRate({ arqTick() }, arqIntervalMs, arqIntervalMs, TimeUnit.MILLISECONDS)
+    }
+
+    private fun arqTick() {
+        val it = outgoing.entries.iterator()
+        while (it.hasNext()) {
+            val (seq, msg) = it.next()
+            val s = sessions[msg.peerID]
+            val remote = s?.activeRemote
+            val pairKey = keys.pairKey(msg.peerID)
+            if (s == null || s.state != PathState.CONNECTED || remote == null || pairKey == null) { it.remove(); continue }
+            msg.roundsLeft--
+            if (msg.roundsLeft <= 0) { it.remove(); continue }
+            sendUnacked(seq, msg, pairKey, remote)
+        }
+        if (outgoing.isEmpty()) { arqTask?.cancel(false); arqTask = null }
+    }
+
+    private fun markCompleted(key: String) {
+        if (completedKeys.add(key)) {
+            completed.addLast(key)
+            while (completed.size > completedCap) { completedKeys.remove(completed.removeFirst()) }
+        }
+    }
+
+    private fun handleData(dp: PonyDirectArq.DataPacket, session: Session, pairKey: ByteArray) {
+        val key = "${session.peerID}#${dp.msgSeq}"
+        val count = dp.chunkCount
+        if (count <= 0 || count > maxChunks) return
+        if (completedKeys.contains(key)) {
+            val full = ByteArray(PonyDirectArq.bitmapLen(count)) { 0xFF.toByte() }
+            session.activeRemote?.let { remote ->
+                socket.send(PonyDirectArq.ack(pairKey, session.sessionNonce, dp.msgSeq, count, full), remote.host, remote.port)
+            }
+            return
+        }
+        val r = incoming.getOrPut(key) { Reassembly(count) }
+        val idx = dp.chunkIndex
+        if (idx < r.chunkCount && r.chunks[idx] == null) {
+            r.chunks[idx] = dp.payload
+            PonyDirectArq.bitmapSet(r.bitmap, idx)
+            r.received++
+        }
+        session.activeRemote?.let { remote ->
+            socket.send(PonyDirectArq.ack(pairKey, session.sessionNonce, dp.msgSeq, r.chunkCount, r.bitmap), remote.host, remote.port)
+        }
+        if (r.received == r.chunkCount) {
+            val out = java.io.ByteArrayOutputStream()
+            for (c in r.chunks) if (c != null) out.write(c)
+            incoming.remove(key)
+            markCompleted(key)
+            delegate?.onPayload(session.peerID, out.toByteArray())
+        }
+    }
+
+    private fun handleAck(ap: PonyDirectArq.AckPacket, session: Session) {
+        val msg = outgoing[ap.msgSeq] ?: return
+        if (msg.peerID != session.peerID) return
+        val count = msg.chunks.size
+        for (i in 0 until count) if (PonyDirectArq.bitmapGet(ap.bitmap, i)) PonyDirectArq.bitmapSet(msg.ackedBitmap, i)
+        var allAcked = true
+        for (i in 0 until count) if (!PonyDirectArq.bitmapGet(msg.ackedBitmap, i)) { allAcked = false; break }
+        if (allAcked) outgoing.remove(ap.msgSeq)
     }
 
     fun stateOf(peerID: String): PathState = sessions[peerID]?.state ?: PathState.IDLE

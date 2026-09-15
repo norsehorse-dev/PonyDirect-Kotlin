@@ -26,6 +26,8 @@ object PonyDirectWire {
     private val LABEL_IDENTIFY_ACK = "ponydirect/id-ack/v1".toByteArray(Charsets.US_ASCII)
     private val LABEL_PROBE = "ponydirect/wan-probe/v1".toByteArray(Charsets.US_ASCII)
     private val LABEL_PONG = "ponydirect/wan-pong/v1".toByteArray(Charsets.US_ASCII)
+    private val LABEL_DATA = "ponydirect/wan-data/v1".toByteArray(Charsets.US_ASCII)
+    private val LABEL_ACK = "ponydirect/wan-ack/v1".toByteArray(Charsets.US_ASCII)
 
     private val rng = SecureRandom()
 
@@ -50,6 +52,14 @@ object PonyDirectWire {
 
     fun pongTag(pairKey: ByteArray, sessionNonce: ByteArray, probeNonce: ByteArray): ByteArray =
         hmac(pairKey, LABEL_PONG + sessionNonce + probeNonce)
+
+    // WAN reliable-datagram (ARQ) authentication. [header] is the fixed fields, the
+    // chunk [payload] is appended, so the tag covers the whole datagram.
+    fun dataTag(pairKey: ByteArray, header: ByteArray, payload: ByteArray): ByteArray =
+        hmac(pairKey, LABEL_DATA + header + payload)
+
+    fun ackTag(pairKey: ByteArray, header: ByteArray, bitmap: ByteArray): ByteArray =
+        hmac(pairKey, LABEL_ACK + header + bitmap)
 
     /** Length-prefixed frame: `type(1) | length(4, big-endian) | payload`. */
     fun frame(type: Byte, payload: ByteArray): ByteArray {

@@ -28,6 +28,10 @@ object PonyDirectWire {
     private val LABEL_PONG = "ponydirect/wan-pong/v1".toByteArray(Charsets.US_ASCII)
     private val LABEL_DATA = "ponydirect/wan-data/v1".toByteArray(Charsets.US_ASCII)
     private val LABEL_ACK = "ponydirect/wan-ack/v1".toByteArray(Charsets.US_ASCII)
+    private val LABEL_STREAM_DATA = "ponydirect/stream-data/v1".toByteArray(Charsets.US_ASCII)
+    private val LABEL_STREAM_ACK = "ponydirect/stream-ack/v1".toByteArray(Charsets.US_ASCII)
+    private val LABEL_STREAM_FIN = "ponydirect/stream-fin/v1".toByteArray(Charsets.US_ASCII)
+    private val LABEL_STREAM_RST = "ponydirect/stream-rst/v1".toByteArray(Charsets.US_ASCII)
 
     private val rng = SecureRandom()
 
@@ -60,6 +64,19 @@ object PonyDirectWire {
 
     fun ackTag(pairKey: ByteArray, header: ByteArray, bitmap: ByteArray): ByteArray =
         hmac(pairKey, LABEL_ACK + header + bitmap)
+
+    // WAN reliable-stream (bulk) authentication.
+    fun streamDataTag(pairKey: ByteArray, header: ByteArray, payload: ByteArray): ByteArray =
+        hmac(pairKey, LABEL_STREAM_DATA + header + payload)
+
+    fun streamAckTag(pairKey: ByteArray, header: ByteArray, blocks: ByteArray): ByteArray =
+        hmac(pairKey, LABEL_STREAM_ACK + header + blocks)
+
+    fun streamFinTag(pairKey: ByteArray, header: ByteArray): ByteArray =
+        hmac(pairKey, LABEL_STREAM_FIN + header)
+
+    fun streamRstTag(pairKey: ByteArray, sessionNonce: ByteArray): ByteArray =
+        hmac(pairKey, LABEL_STREAM_RST + sessionNonce)
 
     /** Length-prefixed frame: `type(1) | length(4, big-endian) | payload`. */
     fun frame(type: Byte, payload: ByteArray): ByteArray {

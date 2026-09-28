@@ -54,7 +54,7 @@ class PonyDirectStreamSender(
     val cwndBytes: Int get() = cwnd
     val ssthreshBytes: Int get() = ssthresh
 
-    fun write(bytes: ByteArray) { require(!finished) { "already finished" }; data += bytes }
+    fun write(bytes: ByteArray) { if (finished) return; data += bytes }
     fun finish() { finished = true }
 
     private fun chunksReady(): Int = if (finished) (data.size + chunk - 1) / chunk else data.size / chunk

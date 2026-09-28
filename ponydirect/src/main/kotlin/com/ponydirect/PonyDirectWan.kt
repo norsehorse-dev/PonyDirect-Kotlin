@@ -26,6 +26,12 @@ class PonyDirectWan(
     interface Delegate {
         fun onPathState(peerID: String, state: PathState)
         fun onPayload(peerID: String, payload: ByteArray)
+        /** Bytes delivered in order over a reliable stream (bulk transfer). Default: ignored. */
+        fun onStreamBytes(peerID: String, bytes: ByteArray) {}
+        /** The inbound stream from this peer finished (all bytes delivered). Default: ignored. */
+        fun onStreamReceiveComplete(peerID: String) {}
+        /** The outbound stream to this peer finished (true) or gave up (false). Default: ignored. */
+        fun onStreamSendComplete(peerID: String, success: Boolean) {}
     }
 
     var delegate: Delegate? = null
@@ -71,6 +77,11 @@ class PonyDirectWan(
     private val incoming = HashMap<String, Reassembly>()
     private val completed = ArrayDeque<String>()
     private val completedKeys = HashSet<String>()
+    private val streamEngines = HashMap<String, PonyDirectStreamEngine>()
+    private val streamRecvDone = HashSet<String>()
+    private val streamSendDone = HashSet<String>()
+    private var streamTask: ScheduledFuture<*>? = null
+    private val streamIntervalMs = 20L
 
     private val probeIntervalMs = 250L
     private val maxProbeRounds = 40
@@ -113,6 +124,9 @@ class PonyDirectWan(
     fun close(peerID: String) = exec.execute {
         val s = sessions.remove(peerID) ?: return@execute
         setState(s, PathState.IDLE)
+        streamEngines.remove(peerID)
+        streamRecvDone.remove(peerID)
+        streamSendDone.remove(peerID)
         if (sessions.isEmpty()) stopTimers()
     }
 
@@ -145,6 +159,20 @@ class PonyDirectWan(
     }
 
     // Candidate gathering ---------------------------------------------------
+
+    /** Human-readable snapshot for on-device debugging. No secrets: candidates are ip:port only. */
+    fun diagnostics(): String {
+        val sb = StringBuilder()
+        sb.append("STUN reflexive: ").append(reflexive ?: "NONE (no public addr)").append('\n')
+        sb.append("host candidates: ").append(hostCandidates.size).append('\n')
+        if (sessions.isEmpty()) sb.append("(no sessions yet)\n")
+        for ((pid, s) in sessions) {
+            sb.append("peer ").append(pid.take(10)).append("\u2026 state=").append(s.state.name.lowercase())
+              .append(" remoteCands=").append(s.remoteCandidates.size)
+              .append(" probe=").append(s.probeRounds).append('/').append(maxProbeRounds).append('\n')
+        }
+        return sb.toString().trimEnd()
+    }
 
     private fun gatherCandidates() {
         if (hostCandidates.isEmpty()) {
@@ -282,6 +310,15 @@ class PonyDirectWan(
                 return
             }
         }
+        val b0 = data[0]
+        if (b0 == PonyDirectStream.SDATA || b0 == PonyDirectStream.SACK || b0 == PonyDirectStream.SFIN || b0 == PonyDirectStream.SRST) {
+            if (data.size < 17) return
+            val nonce = data.copyOfRange(1, 17)
+            val session = sessions.values.firstOrNull { PonyDirectWire.constantTimeEquals(it.sessionNonce, nonce) } ?: return
+            val e = streamEngine(session) ?: return
+            e.onWireDatagram(nowMs(), data)
+            return
+        }
         val parsed = PonyDirectPunch.parse(data) ?: return
         val session = sessions.values.firstOrNull {
             PonyDirectWire.constantTimeEquals(it.sessionNonce, parsed.sessionNonce)
@@ -332,6 +369,7 @@ class PonyDirectWan(
         offerTask?.cancel(false); offerTask = null
         keepaliveTask?.cancel(false); keepaliveTask = null
         arqTask?.cancel(false); arqTask = null
+        streamTask?.cancel(false); streamTask = null
     }
 
     // Public helpers --------------------------------------------------------
@@ -433,6 +471,57 @@ class PonyDirectWan(
         for (i in 0 until count) if (!PonyDirectArq.bitmapGet(msg.ackedBitmap, i)) { allAcked = false; break }
         if (allAcked) { outgoing.remove(ap.msgSeq); msg.onComplete?.invoke(true) }
     }
+
+    // Reliable stream (bulk transfer) ---------------------------------------
+
+    /** Open (or reuse) a reliable byte-stream to a connected peer. */
+    fun openStream(peerID: String) = exec.execute {
+        val s = sessions[peerID] ?: return@execute
+        streamEngine(s)
+    }
+
+    /** Append bytes to the outbound stream to a peer. */
+    fun writeStream(bytes: ByteArray, peerID: String) = exec.execute {
+        val s = sessions[peerID] ?: return@execute
+        streamEngine(s)?.write(bytes)
+    }
+
+    /** Signal end-of-stream for the outbound stream to a peer. */
+    fun finishStream(peerID: String) = exec.execute {
+        val s = sessions[peerID] ?: return@execute
+        streamEngine(s)?.finishSending()
+    }
+
+    private fun streamEngine(session: Session): PonyDirectStreamEngine? {
+        streamEngines[session.peerID]?.let { return it }
+        val pairKey = keys.pairKey(session.peerID) ?: return null
+        val peerID = session.peerID
+        val e = PonyDirectStreamEngine(pairKey, session.sessionNonce) { frame ->
+            val remote = sessions[peerID]?.activeRemote
+            if (remote != null) socket.send(frame, remote.host, remote.port)
+        }
+        streamEngines[peerID] = e
+        ensureStreamTimer()
+        return e
+    }
+
+    private fun ensureStreamTimer() {
+        if (streamTask != null) return
+        streamTask = exec.scheduleAtFixedRate({ streamTick() }, streamIntervalMs, streamIntervalMs, TimeUnit.MILLISECONDS)
+    }
+
+    private fun streamTick() {
+        for ((peerID, e) in streamEngines) {
+            e.tick(nowMs())
+            val bytes = e.read(1 shl 20)
+            if (bytes.isNotEmpty()) delegate?.onStreamBytes(peerID, bytes)
+            if (e.recvComplete() && streamRecvDone.add(peerID)) delegate?.onStreamReceiveComplete(peerID)
+            if (e.sendComplete() && streamSendDone.add(peerID)) delegate?.onStreamSendComplete(peerID, true)
+        }
+        if (streamEngines.isEmpty()) { streamTask?.cancel(false); streamTask = null }
+    }
+
+    private fun nowMs(): Long = System.nanoTime() / 1_000_000L
 
     fun stateOf(peerID: String): PathState = sessions[peerID]?.state ?: PathState.IDLE
 

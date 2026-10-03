@@ -20,6 +20,8 @@ class PonyDirectStreamEngine(
     fun finishSending() = sender.finish()
     fun read(max: Int): ByteArray = receiver.read(max)
     fun sendComplete(): Boolean = sender.isDone()
+    /** Outbound bytes written but not yet acknowledged. A streaming writer waits for this to fall. */
+    fun sendBufferedBytes(): Long = sender.bufferedBytes
     fun recvComplete(): Boolean = receiver.isComplete()
 
     /** Drive the sender: emit due SDATA/SFIN frames. Call on a timer. */

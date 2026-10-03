@@ -10,7 +10,11 @@ sealed class StreamOut {
 
 /**
  * Sender half of the stream ARQ, with congestion control. Chunk-aligned windowed send over the
- * outgoing byte buffer:
+ * outgoing bytes, which are held only until acknowledged: [write] appends whole chunks to a queue,
+ * and chunks below the cumulative ACK are dropped, so memory is bounded by what is in flight plus
+ * what the caller has queued ([bufferedBytes]), not by the size of the stream. A caller streaming a
+ * large file waits for [bufferedBytes] to fall before writing more.
+ *
  *   - RFC 6298 RTO retransmit (Karn's algorithm: no RTT sample on retransmits).
  *   - Congestion window: slow start (exponential) up to ssthresh, then AIMD congestion avoidance
  *     (about one MSS per RTT). A timeout halves ssthresh and restarts slow start at one MSS.
@@ -30,7 +34,14 @@ class PonyDirectStreamSender(
 ) {
     private val chunk = PonyDirectStream.MAX_PAYLOAD   // 1024
 
-    private var data = ByteArray(0)
+    // Chunks from index [firstChunk] onward that are not yet below the cumulative ACK, plus the
+    // partial chunk still being filled. Everything before [firstChunk] has been acked and dropped.
+    private val chunks = ArrayDeque<ByteArray>()
+    private var firstChunk = 0
+    private var tail = ByteArray(chunk)
+    private var tailLen = 0
+    private var written = 0L
+    private var held = 0L
     private var finished = false
 
     private var baseChunk = 0
@@ -54,12 +65,39 @@ class PonyDirectStreamSender(
     val cwndBytes: Int get() = cwnd
     val ssthreshBytes: Int get() = ssthresh
 
-    fun write(bytes: ByteArray) { if (finished) return; data += bytes }
-    fun finish() { finished = true }
+    /** Bytes written but not yet acknowledged (in flight, queued, or in the partial last chunk). */
+    val bufferedBytes: Long get() = held
 
-    private fun chunksReady(): Int = if (finished) (data.size + chunk - 1) / chunk else data.size / chunk
-    private fun chunkBytes(i: Int): ByteArray = data.copyOfRange(i * chunk, minOf((i + 1) * chunk, data.size))
-    private fun totalBytes(): Long = data.size.toLong()
+    fun write(bytes: ByteArray) {
+        if (finished || bytes.isEmpty()) return
+        var off = 0
+        while (off < bytes.size) {
+            val take = minOf(chunk - tailLen, bytes.size - off)
+            System.arraycopy(bytes, off, tail, tailLen, take)
+            tailLen += take; off += take
+            if (tailLen == chunk) { chunks.addLast(tail); tail = ByteArray(chunk); tailLen = 0 }
+        }
+        written += bytes.size
+        held += bytes.size
+    }
+
+    fun finish() {
+        if (finished) return
+        if (tailLen > 0) { chunks.addLast(tail.copyOf(tailLen)); tail = ByteArray(0); tailLen = 0 }
+        finished = true
+    }
+
+    private fun chunksReady(): Int = firstChunk + chunks.size
+    private fun chunkBytes(i: Int): ByteArray = chunks[i - firstChunk]
+    private fun totalBytes(): Long = written
+
+    /** Release chunks that are now below the cumulative ACK. */
+    private fun dropAcked() {
+        while (firstChunk < baseChunk && chunks.isNotEmpty()) {
+            held -= chunks.removeFirst().size
+            firstChunk++
+        }
+    }
 
     fun isDone(): Boolean = finished && baseChunk >= chunksReady()
 
@@ -108,6 +146,7 @@ class PonyDirectStreamSender(
             }
         }
         while (acked.contains(baseChunk)) { acked.remove(baseChunk); baseChunk++ }
+        dropAcked()
         if (newlyAcked > 0) grow(newlyAcked)
     }
 

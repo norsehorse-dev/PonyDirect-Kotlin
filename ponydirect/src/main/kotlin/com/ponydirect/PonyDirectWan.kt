@@ -82,6 +82,10 @@ class PonyDirectWan(
     private val streamSendDone = HashSet<String>()
     private var streamTask: ScheduledFuture<*>? = null
     private val streamIntervalMs = 20L
+    // Outbound backpressure, readable from any thread: bytes handed to writeStream but not yet in the
+    // engine, and the engine's unacknowledged bytes as of the last write or tick.
+    private val streamQueued = ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicLong>()
+    private val streamHeld = ConcurrentHashMap<String, Long>()
 
     private val probeIntervalMs = 250L
     private val maxProbeRounds = 40
@@ -127,6 +131,8 @@ class PonyDirectWan(
         streamEngines.remove(peerID)
         streamRecvDone.remove(peerID)
         streamSendDone.remove(peerID)
+        streamQueued.remove(peerID)
+        streamHeld.remove(peerID)
         if (sessions.isEmpty()) stopTimers()
     }
 
@@ -480,11 +486,29 @@ class PonyDirectWan(
         streamEngine(s)
     }
 
-    /** Append bytes to the outbound stream to a peer. */
-    fun writeStream(bytes: ByteArray, peerID: String) = exec.execute {
-        val s = sessions[peerID] ?: return@execute
-        streamEngine(s)?.write(bytes)
+    /**
+     * Append bytes to the outbound stream to a peer. Returns at once; the bytes are held until the
+     * peer acknowledges them. A caller streaming more than fits in memory should wait while
+     * [streamSendBufferedBytes] is above its own high-water mark before writing more.
+     */
+    fun writeStream(bytes: ByteArray, peerID: String) {
+        val queued = streamQueued.getOrPut(peerID) { java.util.concurrent.atomic.AtomicLong() }
+        queued.addAndGet(bytes.size.toLong())
+        exec.execute {
+            queued.addAndGet(-bytes.size.toLong())
+            val s = sessions[peerID] ?: return@execute
+            val e = streamEngine(s) ?: return@execute
+            e.write(bytes)
+            streamHeld[peerID] = e.sendBufferedBytes()
+        }
     }
+
+    /**
+     * Outbound bytes to [peerID] not yet acknowledged, including ones still queued for the stream
+     * thread. Safe from any thread. Falls as the peer acknowledges; stays flat if the peer stalls.
+     */
+    fun streamSendBufferedBytes(peerID: String): Long =
+        (streamQueued[peerID]?.get() ?: 0L) + (streamHeld[peerID] ?: 0L)
 
     /** Signal end-of-stream for the outbound stream to a peer. */
     fun finishStream(peerID: String) = exec.execute {
@@ -513,6 +537,7 @@ class PonyDirectWan(
     private fun streamTick() {
         for ((peerID, e) in streamEngines) {
             e.tick(nowMs())
+            streamHeld[peerID] = e.sendBufferedBytes()
             val bytes = e.read(1 shl 20)
             if (bytes.isNotEmpty()) delegate?.onStreamBytes(peerID, bytes)
             if (e.recvComplete() && streamRecvDone.add(peerID)) delegate?.onStreamReceiveComplete(peerID)
